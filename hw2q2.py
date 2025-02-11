@@ -5,6 +5,7 @@ from scipy.stats import invgamma as sp_invgam
 
 import matplotlib.pyplot as plt
 from pyBayes.MCMC_Core import MCMC_Gibbs, MCMC_MH, MCMC_Diag
+from pyBayes.util_MCMC_proposal import unif_proposal_log_pdf, unif_proposal_sampler
 
 
 #generate data
@@ -28,7 +29,7 @@ class gaussian_process_post(MCMC_Gibbs):
     phi ~ unif(0, b_phi)
     alpha is fixed as a hyperparameter
     """
-    def __init__(self, initial, t_time_idx, y_data):
+    def __init__(self, initial, t_time_idx, y_data, hyperparam_dict=None):
         #param
         # 0      1       2   3     4--->5
         #[theta, sigma2, mu, tau2, phi, H-inv]
@@ -37,28 +38,45 @@ class gaussian_process_post(MCMC_Gibbs):
         self.n = len(y_data)
 
         #hyperparamters
-        self.hyper_a_sigma = 1
-        self.hyper_b_sigma = 1
-        self.hyper_a_mu = 0
-        self.hyper_b_mu = 1
-        self.hyper_a_tau = 1
-        self.hyper_b_tau = 1
-        self.hyper_b_phi = 6 #be careful!
-        self.hyper_alpha = 2 #be careful!
+        if hyperparam_dict is None:
+            self.hyper_a_sigma = 1
+            self.hyper_b_sigma = 1
+            self.hyper_a_mu = 0
+            self.hyper_b_mu = 1
+            self.hyper_a_tau = 1
+            self.hyper_b_tau = 1
+            self.hyper_b_phi = 20 #be careful!
+            self.hyper_alpha = 2 #be careful!
+        else:
+            self.hyper_a_sigma = hyperparam_dict["a_sigma"]
+            self.hyper_b_sigma = hyperparam_dict["b_sigma"]
+            self.hyper_a_mu = hyperparam_dict["a_mu"]
+            self.hyper_b_mu = hyperparam_dict["b_mu"]
+            self.hyper_a_tau = hyperparam_dict["a_tau"]
+            self.hyper_b_tau = hyperparam_dict["b_tau"]
+            self.hyper_b_phi = hyperparam_dict["b_phi"]
+            self.hyper_alpha = hyperparam_dict["alpha"]
 
         self.MC_sample = []
         initial = initial + [self.make_inv_H_corr_mat(initial[4])]
         self.MC_sample.append(initial)
+        
+        self.phi_accept_counter = 0
 
     def corr_function_power_exp(self, t1, t2, phi):
         return np.exp(-phi * (np.abs(t1-t2)**self.hyper_alpha))
 
-    def make_inv_H_corr_mat(self, phi):
+    def make_inv_H_corr_mat(self, phi, log_det=False):
         corr_mat = np.array([[self.corr_function_power_exp(t1, t2, phi) for t1 in self.t_time_idx] for t2 in self.t_time_idx])
         corr_mat = corr_mat + np.identity(self.n)*0.01
-        L_inv = np.linalg.inv(np.linalg.cholesky(corr_mat))
+        L_chol = np.linalg.cholesky(corr_mat)
+        L_inv = np.linalg.inv(L_chol)
         inv_mat = np.dot(L_inv.T, L_inv)
-        return inv_mat
+        inv_mat_logdet = -np.sum(np.log(L_chol.diagonal()))
+        if log_det:
+            return (inv_mat, inv_mat_logdet)
+        else:
+            return inv_mat
 
     def sampler(self, **kwargs):
         last = self.MC_sample[-1]
@@ -129,10 +147,39 @@ class gaussian_process_post(MCMC_Gibbs):
         # 0      1       2   3     4--->5
         #[theta, sigma2, mu, tau2, phi, H-inv]
         #update new
-        new_phi = 0.5
+        #param
+        #0                  1     2
+        #F0_xi[loc, scale], DP_a, eta
+     
+        def phi_log_pdf_posterior(phi):
+            phi = phi[0]
+            H_inv_mat, H_inv_logdet = self.make_inv_H_corr_mat(phi, log_det=True)
+            
+            quad_one_term = np.reshape(last_param[0] - last_param[2], (1, self.n))
+            log_val = -np.log(self.hyper_b_phi)
+            log_val += (0.5*H_inv_logdet)
+            log_val -= (quad_one_term @ H_inv_mat @ np.transpose(quad_one_term)/(2*last_param[3]))
+            return log_val
+
+        phi_proposal_window = self.hyper_b_phi/3
+        def phi_proposal_log_pdf(from_smpl, to_smpl):
+            phi_proposal_log_pdf = unif_proposal_log_pdf(from_smpl, to_smpl, 
+                                                          lower_lim=0, upper_lim=self.hyper_b_phi, window=phi_proposal_window)
+            return phi_proposal_log_pdf
+        def phi_proposal_sampler(from_smpl):
+            phi_proposal_sample = unif_proposal_sampler(from_smpl, 
+                                                         lower_lim=0, upper_lim=self.hyper_b_phi, window=phi_proposal_window)
+            return phi_proposal_sample
+
+        mh_inst = MCMC_MH(phi_log_pdf_posterior, phi_proposal_log_pdf, phi_proposal_sampler, [last_param[4]])
+        mh_inst.generate_samples(2, verbose=False)
+        new_phi = mh_inst.MC_sample[-1][0]
+        if new_phi != last_param[4]:
+            self.phi_accept_counter += 1
         new_sample[4] = new_phi
         new_sample[5] = self.make_inv_H_corr_mat(new_phi)
         return new_sample
+    
     
 
 class post_gaussian_process_simulator:
@@ -177,16 +224,23 @@ class post_gaussian_process_simulator:
 if __name__=="__main__":
     gibbs_initial_param = [np.zeros(n_sample_size), 1, 0, 1, 2] #no H_inv here
     inst = gaussian_process_post(gibbs_initial_param, x_data, y_data)
-    inst.generate_samples(500)
+    iter_sampler_num = 800
+    inst.generate_samples(iter_sampler_num)
     plt.scatter(x_data, y_data)
-    plt.scatter(x_data, inst.MC_sample[499][0], color="red")
+    plt.scatter(x_data, inst.MC_sample[iter_sampler_num-1][0], color="red")
     plt.show()
+
+    diag_inst = MCMC_Diag()
+    diag_inst.set_mc_samples_from_list([x[1:5] for x in inst.MC_sample])
+    diag_inst.set_variable_names(["sigma2","mu","tau2","phi"])
+    diag_inst.burnin(100)
+    diag_inst.show_traceplot((1,4))
 
     inst2 = post_gaussian_process_simulator(inst.MC_sample, hyper_alpha=2, x_data=x_data)
     plt.scatter(x_data, y_data)
-    plt.plot(inst2.grid, inst2.run(419))
-    plt.plot(inst2.grid, inst2.run(439))
-    plt.plot(inst2.grid, inst2.run(459))
-    plt.plot(inst2.grid, inst2.run(479))
-    plt.plot(inst2.grid, inst2.run(499))
+    plt.plot(inst2.grid, inst2.run(719))
+    plt.plot(inst2.grid, inst2.run(739))
+    plt.plot(inst2.grid, inst2.run(759))
+    plt.plot(inst2.grid, inst2.run(779))
+    plt.plot(inst2.grid, inst2.run(799))
     plt.show()
